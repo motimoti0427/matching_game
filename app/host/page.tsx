@@ -248,6 +248,13 @@ export default function HostPage() {
         status: "voting",
         round: nextRound,
         gameSet: false,
+        // 前ラウンドのRESULT状態をリセットする
+        resultPresenterId: null,
+        resultPhase: "select",
+        resultShowFinal: false,
+        resultMatchRevealed: false,
+        resultAnnouncedIds: [],
+        resultAnnouncedPairKeys: [],
       });
       await makeBotVotes(remainingPlayers, nextRound);
     } catch (e) {

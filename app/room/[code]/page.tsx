@@ -7,6 +7,7 @@ import {
   getDoc,
   onSnapshot,
   setDoc,
+  updateDoc,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 
@@ -117,6 +118,25 @@ export default function RoomPage({
         setStatus(data?.status || "waiting");
         setRound(Number(data?.round ?? 1));
         setGameSet(Boolean(data?.gameSet));
+
+        if (data?.resultPresenterId !== undefined) {
+          setCurrentPlayerId(data.resultPresenterId || null);
+        }
+        if (data?.resultPhase !== undefined) {
+          setPhase(data.resultPhase);
+        }
+        if (data?.resultShowFinal !== undefined) {
+          setShowFinal(Boolean(data.resultShowFinal));
+        }
+        if (data?.resultMatchRevealed !== undefined) {
+          setMatchRevealed(Boolean(data.resultMatchRevealed));
+        }
+        if (Array.isArray(data?.resultAnnouncedIds)) {
+          setAnnouncedIds(data.resultAnnouncedIds);
+        }
+        if (Array.isArray(data?.resultAnnouncedPairKeys)) {
+          setAnnouncedPairKeys(data.resultAnnouncedPairKeys);
+        }
       });
 
       onSnapshot(
@@ -177,8 +197,9 @@ export default function RoomPage({
 
       setVoted(
         vote.exists() &&
-          (vote.data()?.round == null ||
-            Number(vote.data()?.round) === Number(room.data()?.round ?? 1))
+          (vote.data()?.round == null
+            ? Number(room.data()?.round ?? 1) === 1
+            : Number(vote.data()?.round) === Number(room.data()?.round ?? 1))
       );
     };
 
@@ -385,105 +406,93 @@ export default function RoomPage({
   // ==========================
   // 点アニメーション開始
   // ==========================
-  const startReveal = () => {
-    if (!currentPlayerId || !target || !containerRef.current)
-      return;
+  const startReveal = async () => {
+    if (!isHost || !currentPlayerId || !target || !code) return;
 
-    setPhase("arrows");
-    setShowFinal(false);
-    // 矢印アニメーション開始時点ではMATCHを光らせない。
-    // 「運命の結果を見る」を押した瞬間に光らせる。
-    setMatchRevealed(false);
-    setVisibleDots(0);
-
-    const box = containerRef.current.getBoundingClientRect();
-
-    // 矢印は「今回発表する人に入った投票」だけを表示する。
-    // MATCH相手からの逆向き投票をここへ追加しない。
-    // これにより、男性・女性の両側から余計な矢印が伸びない。
-    const revealVotes = currentRoundVotes.filter(
-      (v) => v.toId === target.id
-    );
-
-    const newLines: Line[] = [];
-    const seenLineKeys = new Set<string>();
-
-    revealVotes.forEach((vote) => {
-      const lineKey = `${vote.fromId}__${vote.toId}`;
-      if (seenLineKeys.has(lineKey)) return;
-      seenLineKeys.add(lineKey);
-      const fromPlayer = participants.find(
-        (p) => p.id === vote.fromId
-      );
-
-      if (!fromPlayer) return;
-
-      const from =
-        fromPlayer.gender === "male"
-          ? maleRefs.current[vote.fromId]
-          : femaleRefs.current[vote.fromId];
-
-      const toPlayer = participants.find(
-        (p) => p.id === vote.toId
-      );
-
-      if (!toPlayer) return;
-
-      const to =
-        toPlayer.gender === "male"
-          ? maleRefs.current[toPlayer.id]
-          : femaleRefs.current[toPlayer.id];
-
-      if (!from || !to) return;
-
-      const a = from.getBoundingClientRect();
-      const b = to.getBoundingClientRect();
-
-      const leftToRight = fromPlayer.gender === "male";
-
-      // MATCHしている線かどうかだけ記録しておき、
-      // 実際に光らせるのは「運命の結果を見る」を押した瞬間。
-      const isMatchedLine =
-        matchedPair != null &&
-        ((vote.fromId === matchedPair.aId &&
-          vote.toId === matchedPair.bId) ||
-          (vote.fromId === matchedPair.bId &&
-            vote.toId === matchedPair.aId));
-
-      newLines.push({
-        fromId: vote.fromId,
-        toId: vote.toId,
-
-        x1: leftToRight
-          ? a.right - box.left
-          : a.left - box.left,
-
-        y1: a.top + a.height / 2 - box.top,
-
-        x2: leftToRight
-          ? b.left - box.left
-          : b.right - box.left,
-
-        y2: b.top + b.height / 2 - box.top,
-        matched: isMatchedLine,
-      });
+    await updateDoc(doc(db, "rooms", code), {
+      resultPresenterId: currentPlayerId,
+      resultPhase: "arrows",
+      resultShowFinal: false,
+      resultMatchRevealed: false,
     });
-
-    setLines(newLines);
-
-    const DOT_COUNT = 20;
-    const DOT_INTERVAL = 180;
-
-    for (let i = 1; i <= DOT_COUNT; i++) {
-      setTimeout(() => {
-        setVisibleDots(i);
-      }, i * DOT_INTERVAL);
-    }
-
-    setTimeout(() => {
-      setPhase("reveal");
-    }, DOT_COUNT * DOT_INTERVAL + 100);
   };
+
+  // RESULTの矢印は各端末で同じ投票データから描画する。
+  // 司会者が「結果発表」を押すと、全員の画面で同時に開始する。
+  useEffect(() => {
+    if (status !== "result" || phase !== "arrows" || !currentPlayerId) return;
+
+    const timer = window.setTimeout(() => {
+      if (!containerRef.current) return;
+
+      const currentVoteForReveal = currentRoundVotes.find(
+        (v) => v.fromId === currentPlayerId
+      );
+      const targetForReveal = participants.find(
+        (p) => p.id === currentVoteForReveal?.toId
+      );
+      if (!targetForReveal) return;
+
+      const box = containerRef.current.getBoundingClientRect();
+      const revealVotes = currentRoundVotes.filter(
+        (v) => v.toId === targetForReveal.id
+      );
+      const newLines: Line[] = [];
+      const seenLineKeys = new Set<string>();
+
+      revealVotes.forEach((vote) => {
+        const lineKey = `${vote.fromId}__${vote.toId}`;
+        if (seenLineKeys.has(lineKey)) return;
+        seenLineKeys.add(lineKey);
+
+        const fromPlayer = participants.find((p) => p.id === vote.fromId);
+        const toPlayer = participants.find((p) => p.id === vote.toId);
+        if (!fromPlayer || !toPlayer) return;
+
+        const from =
+          fromPlayer.gender === "male"
+            ? maleRefs.current[vote.fromId]
+            : femaleRefs.current[vote.fromId];
+        const to =
+          toPlayer.gender === "male"
+            ? maleRefs.current[vote.toId]
+            : femaleRefs.current[vote.toId];
+        if (!from || !to) return;
+
+        const a = from.getBoundingClientRect();
+        const b = to.getBoundingClientRect();
+        const leftToRight = fromPlayer.gender === "male";
+
+        const isMatchedLine =
+          matchedPair != null &&
+          ((vote.fromId === matchedPair.aId && vote.toId === matchedPair.bId) ||
+            (vote.fromId === matchedPair.bId && vote.toId === matchedPair.aId));
+
+        newLines.push({
+          fromId: vote.fromId,
+          toId: vote.toId,
+          x1: leftToRight ? a.right - box.left : a.left - box.left,
+          y1: a.top + a.height / 2 - box.top,
+          x2: leftToRight ? b.left - box.left : b.right - box.left,
+          y2: b.top + b.height / 2 - box.top,
+          matched: isMatchedLine,
+        });
+      });
+
+      setLines(newLines);
+      setVisibleDots(0);
+
+      const DOT_COUNT = 20;
+      const DOT_INTERVAL = 180;
+      for (let i = 1; i <= DOT_COUNT; i++) {
+        window.setTimeout(() => setVisibleDots(i), i * DOT_INTERVAL);
+      }
+      window.setTimeout(() => setPhase("reveal"), DOT_COUNT * DOT_INTERVAL + 100);
+    }, 50);
+
+    return () => window.clearTimeout(timer);
+  }, [status, phase, currentPlayerId, participants, votes, round, matchedPair?.key]);
+
 // ==========================
 // 結果発表画面
 // ==========================
@@ -507,21 +516,28 @@ if (status === "result") {
       ) : !currentPlayerId ? (
         <>
           <p className="text-center text-gray-400 mt-4">
-            発表する人を選んでください
+            {isHost ? "発表する人を選んでください" : "司会者が発表する人を選んでいます…"}
           </p>
 
-          <div className="grid grid-cols-2 gap-4 mt-8">
-            {resultCandidates.map((p) => (
-              <button
-                key={p.id}
-                onClick={() => {
-                  setCurrentPlayerId(p.id);
-                  setPhase("select");
-                  setShowFinal(false);
-                  setMatchRevealed(false);
-                  setVisibleDots(0);
-                  setLines([]);
-                }}
+          {isHost && (
+            <div className="grid grid-cols-2 gap-3 sm:gap-4 mt-8">
+              {resultCandidates.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={async () => {
+                    setCurrentPlayerId(p.id);
+                    setPhase("select");
+                    setShowFinal(false);
+                    setMatchRevealed(false);
+                    setVisibleDots(0);
+                    setLines([]);
+                    await updateDoc(doc(db, "rooms", code), {
+                      resultPresenterId: p.id,
+                      resultPhase: "select",
+                      resultShowFinal: false,
+                      resultMatchRevealed: false,
+                    });
+                  }}
                 className={`rounded-2xl p-4 border transition ${
                   p.gender === "male"
                     ? "bg-blue-500/20 border-blue-300"
@@ -537,28 +553,37 @@ if (status === "result") {
                 />
                 <p className="mt-3 font-bold">{p.name}</p>
               </button>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </>
       ) : (
         <>
-          <button
-            onClick={() => {
-              setCurrentPlayerId(null);
-              setPhase("select");
-              setShowFinal(false);
-              setMatchRevealed(false);
-              setVisibleDots(0);
-              setLines([]);
-            }}
-            className="mb-5 text-gray-400"
-          >
-            ← 戻る
-          </button>
+          {isHost && (
+            <button
+              onClick={async () => {
+                setCurrentPlayerId(null);
+                setPhase("select");
+                setShowFinal(false);
+                setMatchRevealed(false);
+                setVisibleDots(0);
+                setLines([]);
+                await updateDoc(doc(db, "rooms", code), {
+                  resultPresenterId: null,
+                  resultPhase: "select",
+                  resultShowFinal: false,
+                  resultMatchRevealed: false,
+                });
+              }}
+              className="mb-5 text-gray-400"
+            >
+              ← 戻る
+            </button>
+          )}
 
           <div
             ref={containerRef}
-            className="relative rounded-3xl bg-white/5 p-6 overflow-hidden"
+            className="relative rounded-3xl bg-white/5 p-3 sm:p-6 overflow-hidden"
           >
             {/* 点々アニメーション */}
             <svg className="absolute inset-0 w-full h-full pointer-events-none">
@@ -593,16 +618,16 @@ if (status === "result") {
               )}
             </svg>
 
-            <div className="grid grid-cols-[90px_1fr_90px] gap-10">
+            <div className="grid grid-cols-[72px_minmax(0,1fr)_72px] gap-2 sm:grid-cols-[90px_1fr_90px] sm:gap-10">
               {/* 男性 */}
-              <div className="space-y-5">
+              <div className="space-y-3 sm:space-y-5">
                 {men.map((m) => (
                   <div
                     key={m.id}
                     ref={(el) => {
                       maleRefs.current[m.id] = el;
                     }}
-                    className={`rounded-xl py-3 text-center font-bold transition-all ${
+                    className={`rounded-xl py-2 sm:py-3 px-1 text-center text-sm sm:text-base font-bold break-words transition-all ${
                       m.id === currentPlayerId
                         ? "bg-blue-500 scale-110 shadow-lg shadow-blue-500/40"
                         : matchRevealed &&
@@ -621,14 +646,14 @@ if (status === "result") {
               <div />
 
               {/* 女性 */}
-              <div className="space-y-5">
+              <div className="space-y-3 sm:space-y-5">
                 {women.map((w) => (
                   <div
                     key={w.id}
                     ref={(el) => {
                       femaleRefs.current[w.id] = el;
                     }}
-                    className={`rounded-xl py-3 text-center font-bold transition-all ${
+                    className={`rounded-xl py-2 sm:py-3 px-1 text-center text-sm sm:text-base font-bold break-words transition-all ${
                       w.id === currentPlayerId
                         ? "bg-pink-500 scale-110 shadow-lg shadow-pink-500/40"
                         : matchRevealed &&
@@ -646,16 +671,19 @@ if (status === "result") {
             </div>
           </div>
           {/* ボタンエリア */}
-          {phase === "select" && duplicateVotes.length > 1 && (
+          {isHost && phase === "select" && duplicateVotes.length > 0 && (
             <button
-              onClick={() => setPhase("duplicate")}
+              onClick={async () => {
+                setPhase("duplicate");
+                await updateDoc(doc(db, "rooms", code), { resultPhase: "duplicate" });
+              }}
               className="mt-8 w-full rounded-full bg-yellow-400 py-4 font-black text-black"
             >
               なんと同じ人を選んでいる人が {duplicateVotes.length} 人います
             </button>
           )}
 
-          {phase === "select" && duplicateVotes.length <= 1 && (
+          {isHost && phase === "select" && duplicateVotes.length === 0 && (
             <button
               onClick={startReveal}
               className="mt-8 w-full rounded-full bg-pink-500 py-4 font-black"
@@ -664,7 +692,7 @@ if (status === "result") {
             </button>
           )}
 
-          {phase === "duplicate" && (
+          {isHost && phase === "duplicate" && (
             <div className="mt-8 rounded-2xl bg-yellow-400/10 border border-yellow-400/40 p-5">
               <p className="text-lg font-black text-yellow-300">
                 {target?.name}さんを選んでいる人
@@ -696,36 +724,38 @@ if (status === "result") {
             </div>
           )}
 
-          {phase === "reveal" && (
+          {isHost && phase === "reveal" && (
             <button
-              onClick={() => {
+              onClick={async () => {
+                // 発表者と、同じ相手を選んで一緒に発表された人を次の候補から除外する
+                const revealedVoterIds = sameTargetVotes.map((v) => v.fromId);
+                const nextIds = Array.from(
+                  new Set([
+                    ...announcedIds,
+                    ...(currentPlayerId ? [currentPlayerId] : []),
+                    ...revealedVoterIds,
+                    ...(matchedPair ? [matchedPair.aId, matchedPair.bId] : []),
+                  ])
+                );
+                const nextPairs = matchedPair
+                  ? announcedPairKeys.includes(matchedPair.key)
+                    ? announcedPairKeys
+                    : [...announcedPairKeys, matchedPair.key]
+                  : announcedPairKeys;
+
                 setShowFinal(true);
                 setMatchRevealed(true);
                 setPhase("result");
+                setAnnouncedIds(nextIds);
+                setAnnouncedPairKeys(nextPairs);
 
-                if (matchedPair) {
-                  setAnnouncedIds((prev) =>
-                    Array.from(
-                      new Set([
-                        ...prev,
-                        matchedPair.aId,
-                        matchedPair.bId,
-                      ])
-                    )
-                  );
-
-                  setAnnouncedPairKeys((prev) =>
-                    prev.includes(matchedPair.key)
-                      ? prev
-                      : [...prev, matchedPair.key]
-                  );
-                } else if (currentPlayerId) {
-                  setAnnouncedIds((prev) =>
-                    prev.includes(currentPlayerId)
-                      ? prev
-                      : [...prev, currentPlayerId]
-                  );
-                }
+                await updateDoc(doc(db, "rooms", code), {
+                  resultPhase: "result",
+                  resultShowFinal: true,
+                  resultMatchRevealed: true,
+                  resultAnnouncedIds: nextIds,
+                  resultAnnouncedPairKeys: nextPairs,
+                });
               }}
               className="mt-8 w-full rounded-full bg-white py-4 text-black text-lg font-black"
             >
@@ -779,15 +809,21 @@ if (status === "result") {
                 </>
               )}
 
-              {!noMoreResults ? (
+              {!noMoreResults && isHost ? (
                 <button
-                  onClick={() => {
+                  onClick={async () => {
                     setCurrentPlayerId(null);
                     setPhase("select");
                     setShowFinal(false);
                     setMatchRevealed(false);
                     setVisibleDots(0);
                     setLines([]);
+                    await updateDoc(doc(db, "rooms", code), {
+                      resultPresenterId: null,
+                      resultPhase: "select",
+                      resultShowFinal: false,
+                      resultMatchRevealed: false,
+                    });
                   }}
                   className="mt-8 w-full rounded-full bg-pink-500 py-3 font-bold"
                 >
