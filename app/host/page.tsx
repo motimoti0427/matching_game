@@ -83,7 +83,14 @@ export default function HostPage() {
     );
     const unsubVotes = onSnapshot(
       collection(db, "rooms", roomCode, "votes"),
-      (snapshot) => setVotes(snapshot.docs.map((d) => d.data() as Vote))
+      (snapshot) =>
+        setVotes(
+          snapshot.docs.map((d) => ({
+            ...(d.data() as Vote),
+            // 投票ドキュメントIDは投票者の参加者IDと同じなので、集計用IDを正規化する
+            fromId: d.id,
+          }))
+        )
     );
 
     return () => {
