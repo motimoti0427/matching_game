@@ -16,7 +16,7 @@ export default function Home() {
         <p className="mt-3 text-2xl font-bold">ラブマゲドン</p>
 
         <div className="mt-6 rounded-full border border-white/20 bg-white/10 px-5 py-2 backdrop-blur">
-          <p className="text-sm">企業対抗 恋愛マッチングゲーム</p>
+          <p className="text-sm">マッチングゲーム</p>
         </div>
 
         <Link
