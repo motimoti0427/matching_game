@@ -56,7 +56,7 @@ export default function JoinPage() {
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="きむ"
+              placeholder=""
               className="w-full rounded-2xl bg-white/10 border border-white/10 py-4 px-4 text-center outline-none"
             />
           </div>
