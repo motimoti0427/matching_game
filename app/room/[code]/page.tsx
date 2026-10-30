@@ -5,6 +5,8 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
+  deleteDoc,
   onSnapshot,
   setDoc,
   updateDoc,
@@ -19,6 +21,9 @@ type Participant = {
   isBot?: boolean;
   active?: boolean;
   joinedAt: number;
+  group?: "A" | "B";
+  points?: number;
+  lastMatchRound?: number;
 };
 
 type Vote = {
@@ -57,6 +62,14 @@ export default function RoomPage({
   const [status, setStatus] = useState("waiting");
   const [round, setRound] = useState(1);
   const [gameSet, setGameSet] = useState(false);
+  const [groupingMode, setGroupingMode] = useState<"gender" | "random">("gender");
+  const [currentPrompt, setCurrentPrompt] = useState("");
+  const [promptSelectionMode, setPromptSelectionMode] = useState<"random" | "manual">("random");
+  const [selectedPrompt, setSelectedPrompt] = useState("地球上でこのメンバーしかいない場合誰と付き合う？");
+  const [prompts, setPrompts] = useState<string[]>([]);
+  const [hostBusy, setHostBusy] = useState(false);
+  const [hostPanelOpen, setHostPanelOpen] = useState(true);
+  const [hostError, setHostError] = useState("");
   const [exists, setExists] = useState<boolean | null>(null);
 
   const [participants, setParticipants] = useState<Participant[]>([]);
@@ -79,6 +92,73 @@ export default function RoomPage({
   const [announcedIds, setAnnouncedIds] = useState<string[]>([]);
   const [announcedPairKeys, setAnnouncedPairKeys] = useState<string[]>([]);
   const lastRoundRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const previousPointsRef = useRef<Record<string, number> | null>(null);
+  const previousHeartRevealRef = useRef(false);
+
+  // Web Audioで効果音を生成。最初のユーザー操作後に音声を有効化する。
+  const playSound = (kind: "point" | "heart" | "match" | "fail" | "tick") => {
+    if (typeof window === "undefined") return;
+    const AudioContextClass = window.AudioContext;
+    if (!AudioContextClass) return;
+    let audio = audioContextRef.current;
+    if (!audio) {
+      audio = new AudioContextClass();
+      audioContextRef.current = audio;
+    }
+    if (audio.state === "suspended") void audio.resume();
+
+    const now = audio.currentTime;
+    // NO MATCHは少し低めの音を下げて、残念感のある短い効果音にする。
+    const notes = kind === "tick" ? [1046]
+      : kind === "point" ? [880, 1175]
+      : kind === "heart" ? [660, 880, 1175]
+      : kind === "fail" ? [392, 330, 262]
+      : [523, 659, 784, 1047];
+    const noteInterval = kind === "fail" ? 0.12 : 0.09;
+    const noteLength = kind === "fail" ? 0.16 : kind === "tick" ? 0.07 : kind === "point" ? 0.18 : 0.32;
+    const volume = kind === "fail" ? 0.09 : kind === "tick" ? 0.07 : kind === "point" ? 0.12 : 0.1;
+    notes.forEach((frequency, index) => {
+      const oscillator = audio!.createOscillator();
+      const gain = audio!.createGain();
+      oscillator.type = kind === "point" || kind === "tick" || kind === "fail" ? "sine" : "triangle";
+      const noteStart = now + index * noteInterval;
+      oscillator.frequency.setValueAtTime(frequency, noteStart);
+      gain.gain.setValueAtTime(0.0001, noteStart);
+      gain.gain.exponentialRampToValueAtTime(volume, noteStart + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, noteStart + noteLength);
+      oscillator.connect(gain);
+      gain.connect(audio!.destination);
+      oscillator.start(noteStart);
+      oscillator.stop(noteStart + noteLength + 0.02);
+    });
+  };
+
+  // 初回タップ時にAudioContextを起動し、以後の自動効果音を鳴らせるようにする。
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (typeof window === "undefined" || !window.AudioContext) return;
+      if (!audioContextRef.current) audioContextRef.current = new window.AudioContext();
+      if (audioContextRef.current.state === "suspended") void audioContextRef.current.resume();
+    };
+    window.addEventListener("pointerdown", unlockAudio, { once: true });
+    return () => window.removeEventListener("pointerdown", unlockAudio);
+  }, []);
+
+  // Firestoreの累計ポイントが増えたタイミングで獲得音を鳴らす。
+  useEffect(() => {
+    const current: Record<string, number> = {};
+    participants.forEach((participant) => {
+      current[participant.id] = Number(participant.points ?? 0);
+    });
+    if (previousPointsRef.current) {
+      const increased = participants.some((participant) =>
+        current[participant.id] > (previousPointsRef.current?.[participant.id] ?? 0)
+      );
+      if (increased) playSound("point");
+    }
+    previousPointsRef.current = current;
+  }, [participants]);
 
   const maleRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const femaleRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -118,6 +198,11 @@ export default function RoomPage({
         setStatus(data?.status || "waiting");
         setRound(Number(data?.round ?? 1));
         setGameSet(Boolean(data?.gameSet));
+        setGroupingMode(data?.groupingMode === "random" ? "random" : "gender");
+        setCurrentPrompt(String(data?.currentPrompt ?? ""));
+        setPromptSelectionMode(data?.promptSelectionMode === "manual" ? "manual" : "random");
+        if (typeof data?.selectedPrompt === "string" && data.selectedPrompt) setSelectedPrompt(data.selectedPrompt);
+        if (Array.isArray(data?.prompts)) setPrompts(data.prompts.filter((v: unknown): v is string => typeof v === "string"));
 
         if (data?.resultPresenterId !== undefined) {
           setCurrentPlayerId(data.resultPresenterId || null);
@@ -255,7 +340,9 @@ export default function RoomPage({
 
     if (!me || me.active === false) return;
     if (!targetPlayer || targetPlayer.active === false) return;
-    if (targetPlayer.gender === me.gender) return;
+    if (groupingMode === "random") {
+      if (!me.group || !targetPlayer.group || targetPlayer.group === me.group) return;
+    } else if (targetPlayer.gender === me.gender) return;
 
     await setDoc(
       doc(db, "rooms", code, "votes", playerId),
@@ -270,6 +357,140 @@ export default function RoomPage({
 
     setVoted(true);
   };
+  const chooseNextPrompt = (roomData: any) => {
+    const saved = Array.isArray(roomData.prompts) && roomData.prompts.length ? roomData.prompts as string[] : prompts;
+    const mode = roomData.promptSelectionMode === "manual" ? "manual" : promptSelectionMode;
+    const manual = typeof roomData.selectedPrompt === "string" && roomData.selectedPrompt ? roomData.selectedPrompt : selectedPrompt;
+    const used = Array.isArray(roomData.usedPrompts) ? roomData.usedPrompts as string[] : [];
+    if (mode === "manual" && saved.includes(manual)) return { prompt: manual, used, mode, manual };
+    const previous = roomData.currentPrompt && !used.includes(String(roomData.currentPrompt)) ? [...used, String(roomData.currentPrompt)] : used;
+    const pool = saved.filter((item) => !previous.includes(item));
+    const prompt = (pool.length ? pool : saved)[Math.floor(Math.random() * (pool.length ? pool.length : saved.length))] || "地球上でこのメンバーしかいない場合誰と付き合う？";
+    return { prompt, used: [...previous, prompt], mode, manual };
+  };
+
+  const createBotVotes = async (players: Participant[], targetRound: number) => {
+    for (const bot of players.filter((p) => p.isBot && p.active !== false)) {
+      const targets = players.filter((p) => p.active !== false && p.id !== bot.id && (groupingMode === "random" ? Boolean(bot.group) && Boolean(p.group) && p.group !== bot.group : p.gender !== bot.gender));
+      if (!targets.length) continue;
+      const targetPlayer = targets[Math.floor(Math.random() * targets.length)];
+      await setDoc(doc(db, "rooms", code, "votes", bot.id), { fromId: bot.id, fromName: bot.name, toId: targetPlayer.id, createdAt: Date.now(), round: targetRound });
+    }
+  };
+
+  const startVotingFromRoom = async () => {
+    if (!isHost || !code || hostBusy || status !== "waiting") return;
+    setHostBusy(true);
+    setHostError("");
+    try {
+      const roomRef = doc(db, "rooms", code);
+      const [roomSnap, playersSnap] = await Promise.all([
+        getDoc(roomRef),
+        getDocs(collection(db, "rooms", code, "participants")),
+      ]);
+      if (!roomSnap.exists()) {
+        setHostError("ルームが見つかりません。");
+        return;
+      }
+      const roomData = roomSnap.data() || {};
+      const allPlayers = playersSnap.docs.map((d) => d.data() as Participant);
+      const activePlayers = allPlayers.filter((p) => p.active !== false);
+      if (activePlayers.length < 2) {
+        setHostError("投票を始めるには2人以上必要です。");
+        return;
+      }
+      const hasBothSides = roomData.groupingMode === "random"
+        ? activePlayers.some((p) => p.group === "A") && activePlayers.some((p) => p.group === "B")
+        : activePlayers.some((p) => p.gender === "male") && activePlayers.some((p) => p.gender === "female");
+      if (!hasBothSides) {
+        setHostError("投票できる左右のグループ（または男女）が揃っていません。");
+        return;
+      }
+      const prompt = typeof roomData.currentPrompt === "string" && roomData.currentPrompt.trim()
+        ? { prompt: roomData.currentPrompt, used: Array.isArray(roomData.usedPrompts) ? roomData.usedPrompts : [], mode: roomData.promptSelectionMode === "manual" ? "manual" : "random", manual: roomData.selectedPrompt || selectedPrompt }
+        : chooseNextPrompt(roomData);
+      await updateDoc(roomRef, {
+        status: "voting",
+        round: 1,
+        gameSet: false,
+        currentPrompt: prompt.prompt,
+        promptSelectionMode: prompt.mode,
+        selectedPrompt: prompt.manual,
+        usedPrompts: prompt.used,
+        resultPresenterId: null,
+        resultPhase: "select",
+        resultShowFinal: false,
+        resultMatchRevealed: false,
+        resultAnnouncedIds: [],
+        resultAnnouncedPairKeys: [],
+      });
+      await createBotVotes(activePlayers, 1);
+    } catch (error) {
+      console.error(error);
+      setHostError("投票を開始できませんでした。");
+    } finally {
+      setHostBusy(false);
+    }
+  };
+
+  const startNextRoundFromRoom = async () => {
+    if (!isHost || !code || hostBusy || status !== "result" || gameSet) return;
+    setHostBusy(true); setHostError("");
+    try {
+      const roomRef = doc(db, "rooms", code);
+      const [roomSnap, playersSnap, votesSnap] = await Promise.all([getDoc(roomRef), getDocs(collection(db, "rooms", code, "participants")), getDocs(collection(db, "rooms", code, "votes"))]);
+      const roomData = roomSnap.data() || {};
+      const latestPlayers = playersSnap.docs.map((d) => d.data() as Participant);
+      const latestVotes = votesSnap.docs.map((d) => ({ ...(d.data() as Vote), fromId: d.id }));
+      const thisRound = Number(roomData.round ?? round);
+      const activeIds = new Set(latestPlayers.filter((p) => p.active !== false).map((p) => p.id));
+      const roundVotes = latestVotes.filter((v) => Number(v.round ?? 1) === thisRound && activeIds.has(v.fromId) && activeIds.has(v.toId));
+      const voteByFrom = new Map(roundVotes.map((v) => [v.fromId, v.toId]));
+      const matchedIds = new Set<string>();
+      for (const v of roundVotes) if (voteByFrom.get(v.toId) === v.fromId) { matchedIds.add(v.fromId); matchedIds.add(v.toId); }
+      const remaining = latestPlayers.filter((p) => p.active !== false && !matchedIds.has(p.id));
+      for (const id of matchedIds) {
+        const player = latestPlayers.find((p) => p.id === id);
+        if (player && player.active !== false) await updateDoc(doc(db, "rooms", code, "participants", id), { active: false, points: Number(player.points ?? 0) + Math.max(0, 11 - thisRound), lastMatchRound: thisRound });
+      }
+      for (const v of votesSnap.docs) await deleteDoc(v.ref);
+      const mode = roomData.groupingMode === "random" ? "random" : "gender";
+      const hasBothSides = mode === "random" ? remaining.some((p) => p.group === "A") && remaining.some((p) => p.group === "B") : remaining.some((p) => p.gender === "male") && remaining.some((p) => p.gender === "female");
+      if (!hasBothSides) { await updateDoc(roomRef, { status: "result", gameSet: true, round: thisRound }); return; }
+      const nextRound = thisRound + 1;
+      const next = chooseNextPrompt(roomData);
+      await updateDoc(roomRef, { status: "voting", round: nextRound, gameSet: false, currentPrompt: next.prompt, promptSelectionMode: next.mode, selectedPrompt: next.manual, usedPrompts: next.used, resultPresenterId: null, resultPhase: "select", resultShowFinal: false, resultMatchRevealed: false, resultAnnouncedIds: [], resultAnnouncedPairKeys: [] });
+      await createBotVotes(remaining, nextRound);
+    } catch (error) { console.error(error); setHostError("次のラウンドを開始できませんでした。"); } finally { setHostBusy(false); }
+  };
+
+  const startNewGameFromRoom = async () => {
+    if (!isHost || !code || hostBusy) return;
+    setHostBusy(true); setHostError("");
+    try {
+      const roomRef = doc(db, "rooms", code);
+      const [roomSnap, playersSnap, votesSnap] = await Promise.all([getDoc(roomRef), getDocs(collection(db, "rooms", code, "participants")), getDocs(collection(db, "rooms", code, "votes"))]);
+      const roomData = roomSnap.data() || {};
+      const allPlayers = playersSnap.docs.map((d) => d.data() as Participant);
+      if (allPlayers.length < 2) { setHostError("次のゲームには2人以上必要です。"); return; }
+      for (const player of allPlayers) await updateDoc(doc(db, "rooms", code, "participants", player.id), { active: true });
+      for (const v of votesSnap.docs) await deleteDoc(v.ref);
+      const next = chooseNextPrompt(roomData);
+      await updateDoc(roomRef, { status: "voting", round: 1, gameNumber: Number(roomData.gameNumber ?? 1) + 1, gameSet: false, currentPrompt: next.prompt, promptSelectionMode: next.mode, selectedPrompt: next.manual, usedPrompts: next.used, resultPresenterId: null, resultPhase: "select", resultShowFinal: false, resultMatchRevealed: false, resultAnnouncedIds: [], resultAnnouncedPairKeys: [] });
+      await createBotVotes(allPlayers.map((p) => ({ ...p, active: true })), 1);
+    } catch (error) { console.error(error); setHostError("次のゲームを開始できませんでした。"); } finally { setHostBusy(false); }
+  };
+
+  const setHostPromptMode = async (mode: "random" | "manual") => {
+    setPromptSelectionMode(mode);
+    if (code) await updateDoc(doc(db, "rooms", code), { promptSelectionMode: mode, selectedPrompt });
+  };
+
+  const setHostManualPrompt = async (prompt: string) => {
+    setSelectedPrompt(prompt);
+    if (code) await updateDoc(doc(db, "rooms", code), { selectedPrompt: prompt, promptSelectionMode: "manual" });
+  };
+
   // ==========================
   // RESULT用データ
   // ==========================
@@ -277,13 +498,13 @@ export default function RoomPage({
     (p) => p.active !== false
   );
 
-  const men = activeParticipants.filter(
-    (p) => p.gender === "male"
-  );
-
-  const women = activeParticipants.filter(
-    (p) => p.gender === "female"
-  );
+  const leftSide = groupingMode === "random"
+    ? activeParticipants.filter((p) => p.group === "A")
+    : activeParticipants.filter((p) => p.gender === "male");
+  const rightSide = groupingMode === "random"
+    ? activeParticipants.filter((p) => p.group === "B")
+    : activeParticipants.filter((p) => p.gender === "female");
+  const isLeftSide = (p: Participant) => groupingMode === "random" ? p.group === "A" : p.gender === "male";
 
   const currentRoundVotes = votes.filter(
     (v) =>
@@ -359,7 +580,24 @@ export default function RoomPage({
     return null;
   })();
 
+  // matchedPair の初期化後に判定し、初回レンダー時のTDZ ReferenceErrorを防ぐ。
+  // 結果のハートが初めて表示された瞬間だけ効果音を鳴らす。
+  useEffect(() => {
+    const isHeartReveal = status === "result" && phase === "result" && showFinal;
+    if (isHeartReveal && !previousHeartRevealRef.current) {
+      playSound(matchedPair ? "match" : "fail");
+    }
+    previousHeartRevealRef.current = isHeartReveal;
+  }, [status, phase, showFinal, matchedPair?.key]);
+
   const matched = !!matchedPair;
+  // NO MATCH時、同じ相手を選んだ人が複数いれば全員の名前を表示する。
+  const noMatchGroup = !matched && currentVote
+    ? Array.from(new Set([
+        ...sameTargetVotes.map((v) => v.fromId),
+        currentVote.toId,
+      ])).map((id) => participants.find((p) => p.id === id)).filter((p): p is Participant => Boolean(p))
+    : [];
 
   // 発表対象を作る。
   // 今回ラウンドで実際に投票した「人」を候補にする。
@@ -399,6 +637,9 @@ export default function RoomPage({
 
     resultCandidates.push(participant);
   }
+
+  const leftResultCandidates = resultCandidates.filter(isLeftSide);
+  const rightResultCandidates = resultCandidates.filter((p) => !isLeftSide(p));
 
   const noMoreResults =
     resultCandidates.length === 0;
@@ -449,19 +690,17 @@ export default function RoomPage({
         const toPlayer = participants.find((p) => p.id === vote.toId);
         if (!fromPlayer || !toPlayer) return;
 
-        const from =
-          fromPlayer.gender === "male"
-            ? maleRefs.current[vote.fromId]
-            : femaleRefs.current[vote.fromId];
-        const to =
-          toPlayer.gender === "male"
-            ? maleRefs.current[vote.toId]
-            : femaleRefs.current[vote.toId];
+        const from = isLeftSide(fromPlayer)
+          ? maleRefs.current[vote.fromId]
+          : femaleRefs.current[vote.fromId];
+        const to = isLeftSide(toPlayer)
+          ? maleRefs.current[vote.toId]
+          : femaleRefs.current[vote.toId];
         if (!from || !to) return;
 
         const a = from.getBoundingClientRect();
         const b = to.getBoundingClientRect();
-        const leftToRight = fromPlayer.gender === "male";
+        const leftToRight = isLeftSide(fromPlayer);
 
         const isMatchedLine =
           matchedPair != null &&
@@ -485,13 +724,44 @@ export default function RoomPage({
       const DOT_COUNT = 20;
       const DOT_INTERVAL = 180;
       for (let i = 1; i <= DOT_COUNT; i++) {
-        window.setTimeout(() => setVisibleDots(i), i * DOT_INTERVAL);
+        window.setTimeout(() => {
+          setVisibleDots(i);
+          playSound("tick");
+        }, i * DOT_INTERVAL);
       }
       window.setTimeout(() => setPhase("reveal"), DOT_COUNT * DOT_INTERVAL + 100);
     }, 50);
 
     return () => window.clearTimeout(timer);
-  }, [status, phase, currentPlayerId, participants, votes, round, matchedPair?.key]);
+  }, [status, phase, currentPlayerId, participants, votes, round, matchedPair?.key, groupingMode]);
+
+const hostControls = isHost ? (
+  <section className="mx-auto mt-5 max-w-3xl rounded-2xl border border-yellow-300/30 bg-yellow-400/10 p-4">
+    <button onClick={() => setHostPanelOpen((v) => !v)} className="flex w-full items-center justify-between font-black text-yellow-200">
+      <span>👑 司会者コントロール</span><span>{hostPanelOpen ? "閉じる ▲" : "開く ▼"}</span>
+    </button>
+    {hostPanelOpen && (
+      <div className="mt-4 space-y-4">
+        <div className="rounded-xl bg-black/20 p-3">
+          <p className="mb-2 text-sm font-bold">次のお題の選び方</p>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={() => setHostPromptMode("random")} className={`rounded-lg p-2 text-sm font-bold ${promptSelectionMode === "random" ? "bg-pink-500" : "bg-white/10"}`}>🎲 ランダム</button>
+            <button onClick={() => setHostPromptMode("manual")} className={`rounded-lg p-2 text-sm font-bold ${promptSelectionMode === "manual" ? "bg-purple-500" : "bg-white/10"}`}>✋ 自分で選ぶ</button>
+          </div>
+          {promptSelectionMode === "manual" && <select value={selectedPrompt} onChange={(e) => setHostManualPrompt(e.target.value)} className="mt-3 w-full rounded-lg bg-[#281333] p-3 text-sm text-white">{(prompts.length ? prompts : [currentPrompt]).filter(Boolean).map((prompt) => <option key={prompt} value={prompt}>{prompt}</option>)}</select>}
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {status === "waiting" && <button onClick={startVotingFromRoom} disabled={hostBusy} className="rounded-xl bg-emerald-600 p-3 font-black disabled:opacity-40">{hostBusy ? "処理中…" : "▶️ 投票開始"}</button>}
+          {status === "voting" && <button onClick={async () => { setHostBusy(true); setHostError(""); try { await updateDoc(doc(db, "rooms", code), { status: "result" }); } catch (e) { console.error(e); setHostError("結果発表に切り替えられませんでした。"); } finally { setHostBusy(false); } }} disabled={hostBusy || currentRoundVotes.length < activeParticipants.length} className="rounded-xl bg-pink-500 p-3 font-black disabled:opacity-40">結果発表（{currentRoundVotes.length}/{activeParticipants.length}）</button>}
+          {status === "result" && !gameSet && <button onClick={startNextRoundFromRoom} disabled={hostBusy} className="rounded-xl bg-pink-500 p-3 font-black disabled:opacity-40">{hostBusy ? "処理中…" : "➡️ 次のラウンドへ"}</button>}
+          <button onClick={startNewGameFromRoom} disabled={hostBusy} className="rounded-xl bg-purple-600 p-3 font-black disabled:opacity-40">{hostBusy ? "処理中…" : "🔄 次のお題へ（新しいゲーム）"}</button>
+        </div>
+        {hostError && <p className="text-sm font-bold text-red-300">{hostError}</p>}
+        <p className="text-xs text-gray-400">メンバー・左右グループ・累計ポイントは維持されます。次のお題へ進むと全員が再参加し、ラウンド1から始まります。</p>
+      </div>
+    )}
+  </section>
+) : null;
 
 // ==========================
 // 結果発表画面
@@ -502,6 +772,8 @@ if (status === "result") {
       <h1 className="text-center text-4xl font-black text-pink-400">
         RESULT
       </h1>
+      {hostControls}
+      {currentPrompt && <p className="mx-auto mt-4 max-w-2xl rounded-2xl bg-pink-500/15 p-4 text-center text-lg font-bold">お題：{currentPrompt}</p>}
 
       {gameSet ? (
         <div className="mt-16 text-center">
@@ -510,8 +782,20 @@ if (status === "result") {
             GAME SET
           </h2>
           <p className="mt-4 text-gray-400">
-            これ以上投票できる組み合わせがありません。
+            このゲームは終了しました。同じメンバーで次のゲームを開始できます。
           </p>
+          <div className="mx-auto mt-8 max-w-md rounded-2xl bg-white/10 p-5 text-left">
+            <h3 className="mb-4 text-xl font-black text-yellow-300">🏆 累計ポイントランキング</h3>
+            <div className="space-y-2">
+              {[...participants].sort((a, b) => Number(b.points ?? 0) - Number(a.points ?? 0) || a.joinedAt - b.joinedAt).map((p, index) => (
+                <div key={p.id} className="flex items-center gap-3 rounded-xl bg-black/20 px-3 py-2">
+                  <span className="w-8 font-black text-yellow-300">{index + 1}位</span>
+                  <span className="flex-1 font-semibold">{p.name}</span>
+                  <span className="font-black">{Number(p.points ?? 0)} pt</span>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       ) : !currentPlayerId ? (
         <>
@@ -520,40 +804,74 @@ if (status === "result") {
           </p>
 
           {isHost && (
-            <div className="grid grid-cols-2 gap-3 sm:gap-4 mt-8">
-              {resultCandidates.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={async () => {
-                    setCurrentPlayerId(p.id);
-                    setPhase("select");
-                    setShowFinal(false);
-                    setMatchRevealed(false);
-                    setVisibleDots(0);
-                    setLines([]);
-                    await updateDoc(doc(db, "rooms", code), {
-                      resultPresenterId: p.id,
-                      resultPhase: "select",
-                      resultShowFinal: false,
-                      resultMatchRevealed: false,
-                    });
-                  }}
-                className={`rounded-2xl p-4 border transition ${
-                  p.gender === "male"
-                    ? "bg-blue-500/20 border-blue-300"
-                    : "bg-pink-500/20 border-pink-300"
-                }`}
-              >
-                <div
-                  className={`mx-auto h-16 w-16 rounded-full ${
-                    p.gender === "male"
-                      ? "bg-blue-500"
-                      : "bg-pink-500"
-                  }`}
-                />
-                <p className="mt-3 font-bold">{p.name}</p>
-              </button>
-              ))}
+            <div className="mt-8 grid grid-cols-2 gap-3 sm:gap-5">
+              <section className="min-w-0 rounded-2xl border border-blue-300/30 bg-blue-500/10 p-2 sm:p-3">
+                <h3 className="mb-3 text-center text-sm font-black text-blue-200">
+                  {groupingMode === "random" ? "グループ A" : "男性"}
+                </h3>
+                <div className="space-y-2">
+                  {leftResultCandidates.map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={async () => {
+                        setCurrentPlayerId(p.id);
+                        setPhase("select");
+                        setShowFinal(false);
+                        setMatchRevealed(false);
+                        setVisibleDots(0);
+                        setLines([]);
+                        await updateDoc(doc(db, "rooms", code), {
+                          resultPresenterId: p.id,
+                          resultPhase: "select",
+                          resultShowFinal: false,
+                          resultMatchRevealed: false,
+                        });
+                      }}
+                      className="w-full rounded-xl border border-blue-300/40 bg-blue-500/20 p-3 text-center transition hover:bg-blue-500/40"
+                    >
+                      <span className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-blue-500 text-sm font-black">
+                        {p.name?.[0] || "?"}
+                      </span>
+                      <span className="mt-2 block break-words text-sm font-bold">{p.name}</span>
+                    </button>
+                  ))}
+                  {leftResultCandidates.length === 0 && <p className="py-4 text-center text-xs text-gray-500">候補なし</p>}
+                </div>
+              </section>
+
+              <section className="min-w-0 rounded-2xl border border-pink-300/30 bg-pink-500/10 p-2 sm:p-3">
+                <h3 className="mb-3 text-center text-sm font-black text-pink-200">
+                  {groupingMode === "random" ? "グループ B" : "女性"}
+                </h3>
+                <div className="space-y-2">
+                  {rightResultCandidates.map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={async () => {
+                        setCurrentPlayerId(p.id);
+                        setPhase("select");
+                        setShowFinal(false);
+                        setMatchRevealed(false);
+                        setVisibleDots(0);
+                        setLines([]);
+                        await updateDoc(doc(db, "rooms", code), {
+                          resultPresenterId: p.id,
+                          resultPhase: "select",
+                          resultShowFinal: false,
+                          resultMatchRevealed: false,
+                        });
+                      }}
+                      className="w-full rounded-xl border border-pink-300/40 bg-pink-500/20 p-3 text-center transition hover:bg-pink-500/40"
+                    >
+                      <span className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-pink-500 text-sm font-black">
+                        {p.name?.[0] || "?"}
+                      </span>
+                      <span className="mt-2 block break-words text-sm font-bold">{p.name}</span>
+                    </button>
+                  ))}
+                  {rightResultCandidates.length === 0 && <p className="py-4 text-center text-xs text-gray-500">候補なし</p>}
+                </div>
+              </section>
             </div>
           )}
         </>
@@ -619,9 +937,9 @@ if (status === "result") {
             </svg>
 
             <div className="grid grid-cols-[72px_minmax(0,1fr)_72px] gap-2 sm:grid-cols-[90px_1fr_90px] sm:gap-10">
-              {/* 男性 */}
+              {/* 左グループ */}
               <div className="space-y-3 sm:space-y-5">
-                {men.map((m) => (
+                {leftSide.map((m) => (
                   <div
                     key={m.id}
                     ref={(el) => {
@@ -645,9 +963,9 @@ if (status === "result") {
 
               <div />
 
-              {/* 女性 */}
+              {/* 右グループ */}
               <div className="space-y-3 sm:space-y-5">
-                {women.map((w) => (
+                {rightSide.map((w) => (
                   <div
                     key={w.id}
                     ref={(el) => {
@@ -695,7 +1013,7 @@ if (status === "result") {
           {isHost && phase === "duplicate" && (
             <div className="mt-8 rounded-2xl bg-yellow-400/10 border border-yellow-400/40 p-5">
               <p className="text-lg font-black text-yellow-300">
-                {target?.name}さんを選んでいる人
+                同じ人を選んでいる人
               </p>
 
               <div className="mt-3 space-y-2">
@@ -765,8 +1083,12 @@ if (status === "result") {
 
           {phase === "result" && showFinal && (
             <div className="mt-10 text-center">
-              <div className="animate-pulse text-8xl mb-4">
-                {matched ? "❤️" : "💔"}
+              <div className="relative mx-auto mb-4 flex h-28 items-center justify-center">
+                {matched && <span className="pointer-events-none absolute left-1/2 top-1 -translate-x-16 text-3xl animate-bounce">💕</span>}
+                {matched && <span className="pointer-events-none absolute right-1/2 bottom-1 translate-x-16 text-2xl animate-ping">💗</span>}
+                <div className={`${matched ? "animate-bounce" : "animate-pulse"} text-8xl`}>
+                  {matched ? "❤️" : "💔"}
+                </div>
               </div>
 
               <h2
@@ -799,12 +1121,20 @@ if (status === "result") {
                 </>
               ) : (
                 <>
-                  <p className="mt-4 text-xl font-bold">
-                    {current?.name} × {target?.name}
+                  <p className="mt-4 text-gray-300">
+                    {noMatchGroup.length > 2
+                      ? `${target?.name ?? "相手"}さんを選んだメンバー`
+                      : "今回の組み合わせ"}
                   </p>
-
-                  <p className="mt-2 text-gray-400">
-                    今回は想いは届きませんでした
+                  <div className="mt-3 flex flex-wrap justify-center gap-2">
+                    {(noMatchGroup.length ? noMatchGroup : [current, target].filter((p): p is Participant => Boolean(p))).map((p) => (
+                      <span key={p.id} className="rounded-xl bg-white/10 px-4 py-3 font-bold">
+                        {p.name}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="mt-3 text-gray-400">
+                    今回は相互マッチになりませんでした
                   </p>
                 </>
               )}
@@ -860,8 +1190,8 @@ const me = participants.find((p) => p.id === playerId);
 
 if (me?.active === false && status === "voting") {
   return (
-    <main className="min-h-screen bg-[#12001F] text-white flex items-center justify-center">
-      <div className="text-center">
+    <main className="min-h-screen bg-[#12001F] text-white flex items-center justify-center p-5">
+      <div className="w-full max-w-md text-center">
         <div className="text-7xl">💘</div>
         <h1 className="text-3xl font-black mt-4">
           マッチ成立！
@@ -869,6 +1199,17 @@ if (me?.active === false && status === "voting") {
         <p className="mt-3 text-gray-400">
           あなたは次のラウンドには参加しません。
         </p>
+        {isHost && (
+          <p className="mt-3 text-sm font-bold text-yellow-200">
+            司会者として、引き続きゲームを進行できます。
+          </p>
+        )}
+        {hostControls}
+        {currentPrompt && (
+          <p className="mt-4 rounded-2xl border border-pink-400/40 bg-pink-500/15 p-4 font-bold text-pink-200">
+            お題：{currentPrompt}
+          </p>
+        )}
       </div>
     </main>
   );
@@ -886,6 +1227,8 @@ if (voted && status === "voting") {
         <h1 className="text-3xl font-black mt-4">
           投票完了！
         </h1>
+        {hostControls}
+        {currentPrompt && <p className="mt-4 max-w-sm px-5 font-bold text-pink-300">お題：{currentPrompt}</p>}
 
         <p className="mt-3 text-gray-400">
           結果発表までお待ちください
@@ -895,11 +1238,11 @@ if (voted && status === "voting") {
   );
 }
 
-const candidates = participants.filter(
-  (p) =>
-    p.active !== false &&
-    p.id !== playerId &&
-    p.gender !== me?.gender
+const candidates = participants.filter((p) =>
+  p.active !== false && p.id !== playerId &&
+  (groupingMode === "random"
+    ? Boolean(me?.group) && Boolean(p.group) && p.group !== me?.group
+    : p.gender !== me?.gender)
 );
 
 // ==========================
@@ -911,18 +1254,20 @@ return (
       <p className="text-center text-pink-400 tracking-[0.3em]">
         ROOM {code}
       </p>
+      {hostControls}
 
       <h1 className="text-center text-3xl font-black mt-3">
         気になる人を選ぼう
       </h1>
+      {currentPrompt && <p className="mt-5 rounded-2xl border border-pink-400/40 bg-pink-500/15 p-4 text-center text-lg font-bold">お題：{currentPrompt}</p>}
 
       <p className="text-center mt-2 text-pink-300">
         {name}
         {isHost && " 👑"}
       </p>
 
-      <p className="text-center text-gray-400 mt-1">
-        異性を1人選択してください
+      <p className="text-center text-gray-400 mt-3">
+        {groupingMode === "random" ? "反対グループから1人選択してください" : "異性を1人選択してください"}
       </p>
 
       <div className="grid grid-cols-2 gap-4 mt-8">
