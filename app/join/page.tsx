@@ -11,12 +11,13 @@ export default function JoinPage() {
   const [gender, setGender] = useState<"male" | "female">("male");
 
   const joinRoom = () => {
-    if (!code || !name) return;
+    const roomCode = code.trim().toUpperCase();
+    const nickname = name.trim();
+
+    if (roomCode.length !== 4 || !nickname) return;
 
     router.push(
-      `/room/${code.toUpperCase()}?name=${encodeURIComponent(
-        name
-      )}&gender=${gender}`
+      `/room/${roomCode}?name=${encodeURIComponent(nickname)}&gender=${gender}`
     );
   };
 
