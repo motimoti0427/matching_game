@@ -53,6 +53,7 @@ export default function RoomPage({
     name?: string;
     host?: string;
     gender?: string;
+    spectator?: string;
   }>;
 }) {
   const [code, setCode] = useState("");
