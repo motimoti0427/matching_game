@@ -1237,6 +1237,19 @@ if (isSpectatorHost && (status === "waiting" || status === "voting")) {
   );
 }
 
+// 投票開始前は、司会以外の参加者には待機画面だけを表示する。
+if (status === "waiting" && !isHost) {
+  return (
+    <main className="min-h-screen bg-[#12001F] text-white flex items-center justify-center p-5">
+      <div className="w-full max-w-md text-center">
+        <div className="text-6xl">⏳</div>
+        <h1 className="mt-4 text-2xl font-black">待機中</h1>
+        <p className="mt-3 text-gray-300">司会が投票を開始するまでお待ちください。</p>
+      </div>
+    </main>
+  );
+}
+
 if (me?.active === false && status === "voting") {
   return (
     <main className="min-h-screen bg-[#12001F] text-white flex items-center justify-center p-5">
