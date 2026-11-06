@@ -59,6 +59,7 @@ export default function RoomPage({
   const [name, setName] = useState("名無し");
   const [playerId, setPlayerId] = useState("");
   const [isHost, setIsHost] = useState(false);
+  const [isSpectatorHost, setIsSpectatorHost] = useState(false);
   const [status, setStatus] = useState("waiting");
   const [round, setRound] = useState(1);
   const [gameSet, setGameSet] = useState(false);
@@ -176,12 +177,14 @@ export default function RoomPage({
 
       const playerName = s.name || "名無し";
       const hostFlag = s.host === "1";
+      const spectatorHostFlag = hostFlag && s.spectator === "1";
       const gender =
         (s.gender as "male" | "female") || "male";
 
       setCode(roomCode);
       setName(playerName);
       setIsHost(hostFlag);
+      setIsSpectatorHost(spectatorHostFlag);
 
       const roomRef = doc(db, "rooms", roomCode);
       const room = await getDoc(roomRef);
@@ -242,50 +245,43 @@ export default function RoomPage({
         }
       );
 
-      const key = `player-${roomCode}`;
+      if (spectatorHostFlag) {
+        // 司会専用モードは参加者として登録せず、投票にも加わらない。
+        setPlayerId("");
+        setVoted(false);
+      } else {
+        const key = `player-${roomCode}`;
+        pid = localStorage.getItem(key) || crypto.randomUUID();
+        localStorage.setItem(key, pid);
+        setPlayerId(pid);
 
-      pid =
-        localStorage.getItem(key) || crypto.randomUUID();
+        const participantRef = doc(db, "rooms", roomCode, "participants", pid);
+        const existingParticipant = await getDoc(participantRef);
+        const existingData = existingParticipant.exists()
+          ? existingParticipant.data()
+          : undefined;
 
-      localStorage.setItem(key, pid);
-      setPlayerId(pid);
+        await setDoc(
+          participantRef,
+          {
+            id: pid,
+            name: playerName,
+            gender,
+            isHost: hostFlag,
+            joinedAt: existingData?.joinedAt ?? Date.now(),
+            active: existingData?.active === false ? false : true,
+          },
+          { merge: true }
+        );
 
-      const participantRef = doc(
-        db,
-        "rooms",
-        roomCode,
-        "participants",
-        pid
-      );
-
-      const existingParticipant = await getDoc(participantRef);
-      const existingData = existingParticipant.exists()
-        ? existingParticipant.data()
-        : undefined;
-
-      await setDoc(
-        participantRef,
-        {
-          id: pid,
-          name: playerName,
-          gender,
-          isHost: hostFlag,
-          joinedAt: existingData?.joinedAt ?? Date.now(),
-          active: existingData?.active === false ? false : true,
-        },
-        { merge: true }
-      );
-
-      const vote = await getDoc(
-        doc(db, "rooms", roomCode, "votes", pid)
-      );
-
-      setVoted(
-        vote.exists() &&
-          (vote.data()?.round == null
-            ? Number(room.data()?.round ?? 1) === 1
-            : Number(vote.data()?.round) === Number(room.data()?.round ?? 1))
-      );
+        const vote = await getDoc(doc(db, "rooms", roomCode, "votes", pid));
+        setVoted(
+          vote.exists() &&
+            (vote.data()?.round == null
+              ? Number(room.data()?.round ?? 1) === 1
+              : Number(vote.data()?.round) === Number(room.data()?.round ?? 1))
+        );
+      }
     };
 
     load();
@@ -638,6 +634,15 @@ export default function RoomPage({
     resultCandidates.push(participant);
   }
 
+  // 発表候補ごとに、本人以外で同じ相手へ投票した人数を数える。
+  const getOtherDuplicateCount = (participantId: string) => {
+    const ownVote = currentRoundVotes.find((v) => v.fromId === participantId);
+    if (!ownVote) return 0;
+    return currentRoundVotes.filter(
+      (v) => v.toId === ownVote.toId && v.fromId !== participantId
+    ).length;
+  };
+
   const leftResultCandidates = resultCandidates.filter(isLeftSide);
   const rightResultCandidates = resultCandidates.filter((p) => !isLeftSide(p));
 
@@ -800,11 +805,10 @@ if (status === "result") {
       ) : !currentPlayerId ? (
         <>
           <p className="text-center text-gray-400 mt-4">
-            {isHost ? "発表する人を選んでください" : "司会者が発表する人を選んでいます…"}
+            {isHost ? "発表する人を選んでください" : "司会者が発表する人を選んでいます。候補と注目表示は全員に共有されています。"}
           </p>
 
-          {isHost && (
-            <div className="mt-8 grid grid-cols-2 gap-3 sm:gap-5">
+          <div className="mt-8 grid grid-cols-2 gap-3 sm:gap-5">
               <section className="min-w-0 rounded-2xl border border-blue-300/30 bg-blue-500/10 p-2 sm:p-3">
                 <h3 className="mb-3 text-center text-sm font-black text-blue-200">
                   {groupingMode === "random" ? "グループ A" : "男性"}
@@ -813,6 +817,7 @@ if (status === "result") {
                   {leftResultCandidates.map((p) => (
                     <button
                       key={p.id}
+                      disabled={!isHost}
                       onClick={async () => {
                         setCurrentPlayerId(p.id);
                         setPhase("select");
@@ -827,12 +832,21 @@ if (status === "result") {
                           resultMatchRevealed: false,
                         });
                       }}
-                      className="w-full rounded-xl border border-blue-300/40 bg-blue-500/20 p-3 text-center transition hover:bg-blue-500/40"
+                      className={`w-full rounded-xl p-3 text-center transition ${
+                        getOtherDuplicateCount(p.id) >= 2
+                          ? "border-2 border-yellow-300 bg-yellow-400/20 shadow-lg shadow-yellow-500/20"
+                          : "border border-blue-300/40 bg-blue-500/20"
+                      } ${isHost ? "hover:bg-blue-500/40" : "cursor-default"}`}
                     >
                       <span className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-blue-500 text-sm font-black">
                         {p.name?.[0] || "?"}
                       </span>
                       <span className="mt-2 block break-words text-sm font-bold">{p.name}</span>
+                      {getOtherDuplicateCount(p.id) >= 2 && (
+                        <span className="mt-2 block rounded-full bg-yellow-300 px-2 py-1 text-xs font-black text-black">
+                          🔥 人気集中・他{getOtherDuplicateCount(p.id)}人と被り
+                        </span>
+                      )}
                     </button>
                   ))}
                   {leftResultCandidates.length === 0 && <p className="py-4 text-center text-xs text-gray-500">候補なし</p>}
@@ -847,6 +861,7 @@ if (status === "result") {
                   {rightResultCandidates.map((p) => (
                     <button
                       key={p.id}
+                      disabled={!isHost}
                       onClick={async () => {
                         setCurrentPlayerId(p.id);
                         setPhase("select");
@@ -861,19 +876,27 @@ if (status === "result") {
                           resultMatchRevealed: false,
                         });
                       }}
-                      className="w-full rounded-xl border border-pink-300/40 bg-pink-500/20 p-3 text-center transition hover:bg-pink-500/40"
+                      className={`w-full rounded-xl p-3 text-center transition ${
+                        getOtherDuplicateCount(p.id) >= 2
+                          ? "border-2 border-yellow-300 bg-yellow-400/20 shadow-lg shadow-yellow-500/20"
+                          : "border border-pink-300/40 bg-pink-500/20"
+                      } ${isHost ? "hover:bg-pink-500/40" : "cursor-default"}`}
                     >
                       <span className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-pink-500 text-sm font-black">
                         {p.name?.[0] || "?"}
                       </span>
                       <span className="mt-2 block break-words text-sm font-bold">{p.name}</span>
+                      {getOtherDuplicateCount(p.id) >= 2 && (
+                        <span className="mt-2 block rounded-full bg-yellow-300 px-2 py-1 text-xs font-black text-black">
+                          🔥 人気集中・他{getOtherDuplicateCount(p.id)}人と被り
+                        </span>
+                      )}
                     </button>
                   ))}
                   {rightResultCandidates.length === 0 && <p className="py-4 text-center text-xs text-gray-500">候補なし</p>}
                 </div>
               </section>
-            </div>
-          )}
+          </div>
         </>
       ) : (
         <>
@@ -989,16 +1012,23 @@ if (status === "result") {
             </div>
           </div>
           {/* ボタンエリア */}
-          {isHost && phase === "select" && duplicateVotes.length > 0 && (
-            <button
-              onClick={async () => {
-                setPhase("duplicate");
-                await updateDoc(doc(db, "rooms", code), { resultPhase: "duplicate" });
-              }}
-              className="mt-8 w-full rounded-full bg-yellow-400 py-4 font-black text-black"
-            >
-              なんと同じ人を選んでいる人が {duplicateVotes.length} 人います
-            </button>
+          {phase === "select" && duplicateVotes.length > 0 && (
+            isHost ? (
+              <button
+                onClick={async () => {
+                  setPhase("duplicate");
+                  await updateDoc(doc(db, "rooms", code), { resultPhase: "duplicate" });
+                }}
+                className="mt-8 w-full rounded-full bg-yellow-400 py-4 font-black text-black"
+              >
+                なんと同じ人を選んでいる人が {duplicateVotes.length} 人います
+              </button>
+            ) : (
+              <div className="mt-8 rounded-2xl border border-yellow-300/50 bg-yellow-400/10 p-4 text-center">
+                <p className="font-black text-yellow-200">⚡ 同じ人を選んでいる人がいます！</p>
+                <p className="mt-1 text-sm text-gray-200">司会者がこのメンバーをまとめて発表します。</p>
+              </div>
+            )
           )}
 
           {isHost && phase === "select" && duplicateVotes.length === 0 && (
@@ -1010,7 +1040,7 @@ if (status === "result") {
             </button>
           )}
 
-          {isHost && phase === "duplicate" && (
+          {phase === "duplicate" && (
             <div className="mt-8 rounded-2xl bg-yellow-400/10 border border-yellow-400/40 p-5">
               <p className="text-lg font-black text-yellow-300">
                 同じ人を選んでいる人
@@ -1033,12 +1063,16 @@ if (status === "result") {
                   })}
               </div>
 
-              <button
-                onClick={startReveal}
-                className="mt-5 w-full rounded-full bg-pink-500 py-4 font-black"
-              >
-                全員の想いを公開
-              </button>
+              {isHost ? (
+                <button
+                  onClick={startReveal}
+                  className="mt-5 w-full rounded-full bg-pink-500 py-4 font-black"
+                >
+                  全員の想いを公開
+                </button>
+              ) : (
+                <p className="mt-4 text-center text-sm text-gray-300">司会者が全員の想いを公開します。</p>
+              )}
             </div>
           )}
 
@@ -1187,6 +1221,21 @@ if (status === "result") {
 // 脱落済み画面
 // ==========================
 const me = participants.find((p) => p.id === playerId);
+
+// 司会専用モードは投票せず、進行状況と司会コントロールだけを表示する。
+if (isSpectatorHost && (status === "waiting" || status === "voting")) {
+  return (
+    <main className="min-h-screen bg-[#12001F] text-white flex items-center justify-center p-5">
+      <div className="w-full max-w-md text-center">
+        <div className="text-6xl">👑</div>
+        <h1 className="mt-4 text-3xl font-black">司会進行中</h1>
+        <p className="mt-3 text-gray-300">{status === "waiting" ? "参加者が集まるのを待っています。" : "参加者の投票を待っています。"}</p>
+        {currentPrompt && <p className="mt-4 rounded-2xl bg-pink-500/15 p-4 font-bold text-pink-200">お題：{currentPrompt}</p>}
+        {hostControls}
+      </div>
+    </main>
+  );
+}
 
 if (me?.active === false && status === "voting") {
   return (

@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { QRCodeSVG } from "qrcode.react";
 import {
   collection,
   deleteDoc,
@@ -58,7 +57,6 @@ function getMutualMatchIds(players: Player[], votes: Vote[], round: number) {
 
 export default function HostPage() {
   const [created, setCreated] = useState(false);
-  const [siteOrigin, setSiteOrigin] = useState("");
   const [roomCode, setRoomCode] = useState("");
   const [existingRoomCode, setExistingRoomCode] = useState("");
   const [loadingExistingRoom, setLoadingExistingRoom] = useState(false);
@@ -83,10 +81,6 @@ export default function HostPage() {
     "一番気を使わない人は？",
     "誰にも言えない秘密を言うとしたら？",
   ]);
-
-  useEffect(() => {
-    setSiteOrigin(window.location.origin);
-  }, []);
 
   useEffect(() => {
     if (!roomCode) return;
@@ -442,6 +436,13 @@ export default function HostPage() {
     window.open(url, "_blank");
   };
 
+  // 参加者として投票せず、司会専用でゲームを進行する。
+  const openSpectatorHost = () => {
+    if (!roomCode) return;
+    const url = `/room/${roomCode}?name=${encodeURIComponent(hostName.trim() || "司会")}&host=1&spectator=1&gender=${hostGender}`;
+    window.open(url, "_blank");
+  };
+
   const activePlayers = players.filter((p) => p.active !== false);
   const currentRoundVotes = votes.filter((v) => Number(v.round ?? 1) === round);
   const votedIds = new Set(currentRoundVotes.map((v) => v.fromId));
@@ -462,18 +463,6 @@ export default function HostPage() {
           {created && <p className="mt-2 text-sm text-gray-400">ROUND {round} / {status === "waiting" ? "待機中" : status === "voting" ? "投票中" : "結果発表"}</p>}
           {created && status !== "waiting" && <p className="mt-4 rounded-xl bg-pink-500/20 p-3 font-bold">お題：{roomPrompt}</p>}
         </div>
-
-        {created && roomCode && siteOrigin && (
-          <div className="mt-5 rounded-3xl border border-pink-300/20 bg-white p-5 text-center text-[#24102f]">
-            <p className="text-lg font-black">📱 QRコードで参加</p>
-            <p className="mt-1 text-sm text-gray-600">スマホのカメラで読み取ると、参加画面が開きます。</p>
-            <div className="mx-auto mt-4 flex w-fit rounded-2xl bg-white p-3">
-              <QRCodeSVG value={`${siteOrigin}/join?code=${encodeURIComponent(roomCode)}`} size={210} level="H" includeMargin />
-            </div>
-            <p className="mt-3 break-all text-xs text-gray-500">{siteOrigin}/join?code={roomCode}</p>
-            <p className="mt-2 text-xs text-gray-500">ルームコード：<strong className="tracking-widest">{roomCode}</strong></p>
-          </div>
-        )}
 
         <input value={hostName} onChange={(e) => setHostName(e.target.value)} placeholder="司会者の名前" className="mt-6 w-full rounded-2xl bg-white/10 border border-white/10 py-4 px-4 text-center outline-none" />
         <div className="mt-4">
@@ -534,7 +523,8 @@ export default function HostPage() {
           </>
         ) : (
           <>
-            <button onClick={joinAsHost} disabled={!hostName.trim()} className="mt-5 w-full rounded-full bg-purple-500 py-4 font-bold disabled:opacity-40">👑 司会として参加</button>
+            <button onClick={joinAsHost} disabled={!hostName.trim()} className="mt-5 w-full rounded-full bg-purple-500 py-4 font-bold disabled:opacity-40">👑 司会として参加（投票にも参加）</button>
+            <button onClick={openSpectatorHost} className="mt-3 w-full rounded-full border border-yellow-300/50 bg-yellow-400/15 py-4 font-bold text-yellow-200">🎤 司会専用で進行（投票に参加しない）</button>
             <button onClick={startGame} disabled={busy || status !== "waiting" || activePlayers.length < 2} className="mt-3 w-full rounded-full bg-green-500 py-4 font-bold disabled:opacity-40">🎮 投票開始</button>
             <div className="grid grid-cols-2 gap-3 mt-3">
               <button onClick={() => addBot("male")} disabled={status !== "waiting"} className="rounded-xl bg-blue-600 py-3 font-bold disabled:opacity-40">🤖 男BOT</button>
