@@ -40,10 +40,13 @@ export default function JoinPage() {
             <input
               value={code}
               onChange={(e) =>
-                setCode(e.target.value.toUpperCase())
+                setCode(e.target.value.replace(/[^a-zA-Z0-9]/g, "").slice(0, 4))
               }
               maxLength={4}
               placeholder="ABCD"
+              autoComplete="off"
+              autoCapitalize="characters"
+              spellCheck={false}
               className="w-full rounded-2xl bg-white/10 border border-white/10 py-4 text-center text-3xl tracking-[0.3em] font-bold outline-none uppercase"
             />
           </div>
